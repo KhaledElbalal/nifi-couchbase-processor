@@ -4,7 +4,7 @@ import com.couchbase.client.java.Cluster;
 import com.couchbase.client.java.Bucket;
 import com.couchbase.client.java.Collection;
 import com.couchbase.client.java.query.QueryResult;
-import com.couchbase.client.java.json.JsonObject;
+
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.annotation.lifecycle.OnStopped;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
@@ -82,11 +82,11 @@ public class GetCouchbase extends AbstractProcessor {
         .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
         .build();
 
-    public static final PropertyDescriptor OUTPUT_FILE_PATH = new PropertyDescriptor.Builder()
-        .name("Output File Path")
-        .description("The path where the JSON file will be written")
-        .required(true)
-        .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+    public static final PropertyDescriptor BATCH_SIZE_MB = new PropertyDescriptor.Builder()
+        .name("Batch Size (MB)")
+        .description("The size of each batch in MB")
+        .defaultValue("100")
+        .addValidator(StandardValidators.LONG_VALIDATOR)
         .build();
 
     private Cluster cluster;
@@ -100,7 +100,7 @@ public class GetCouchbase extends AbstractProcessor {
     protected void init(ProcessorInitializationContext context) {
         super.init(context);
         this.descriptors = Arrays.asList(
-            CONNECTION_NAME, USERNAME, PASSWORD, BUCKET, SCOPE, COLLECTION, OUTPUT_FILE_PATH
+            CONNECTION_NAME, USERNAME, PASSWORD, BUCKET, SCOPE, COLLECTION, BATCH_SIZE_MB
         );
 
         this.descriptors = Collections.unmodifiableList(this.descriptors);
@@ -136,22 +136,40 @@ public class GetCouchbase extends AbstractProcessor {
 
     @Override
     public void onTrigger(ProcessContext context, ProcessSession session) throws ProcessException {
-        FlowFile flowFile = session.get();
+        FlowFile flowFile = session.create();
         if (flowFile == null) {
             return;
         }
 
         try {
-            // Query Couchbase to get documents
-            // Log start time
+            flowFile = session.append(flowFile, out -> out.write("[".getBytes(StandardCharsets.UTF_8)));
+
             long start = System.currentTimeMillis();
-            QueryResult result = cluster.query(String.format("SELECT * FROM `%s`.`%s`.`%s`", bucket.name(), collection.scopeName(), collection.name()));
 
-            List<JsonObject> resultContent = result.rowsAsObject();
+            QueryResult countOfDocuments = cluster.query(String.format("SELECT COUNT(*) FROM `%s`.`%s`.`%s`", bucket.name(), collection.scopeName(), collection.name()));
+            long count = countOfDocuments.rowsAsObject().get(0).getLong("$1");
 
-            String resultContentString = resultContent.toString();
+            QueryResult documentSize = cluster.query(String.format("SELECT AVG(LENGTH(ENCODE_JSON(`%s`.`%s`.`%s`))) FROM `%s`.`%s`.`%s` LIMIT 100", bucket.name(), collection.scopeName(), collection.name(), bucket.name(), collection.scopeName(), collection.name()));
+            long averageSize = 8 * documentSize.rowsAsObject().get(0).getLong("$1");
 
-            flowFile = session.write(flowFile, out -> out.write(resultContentString.getBytes(StandardCharsets.UTF_8)));
+            long megabyteLimit = 1024 * 1024 * Long.parseLong(context.getProperty(BATCH_SIZE_MB).getValue());
+            long batchSize = megabyteLimit / averageSize;
+            long offset = 0;
+            long limit = batchSize;
+            for (long i = 0; i < count; i += batchSize) {
+                QueryResult result = cluster.query(String.format("SELECT * FROM `%s`.`%s`.`%s` LIMIT %d OFFSET %d", bucket.name(), collection.scopeName(), collection.name(), limit, offset));
+                offset += batchSize;
+                limit += batchSize;
+                String resultContentString = result.rowsAsObject().toString();
+                resultContentString = resultContentString.substring(1, resultContentString.length() - 1);
+                if(i + batchSize < count) {
+                    resultContentString += ",";
+                }
+                final String processedResult = resultContentString;
+                flowFile = session.append(flowFile, out -> out.write(processedResult.getBytes(StandardCharsets.UTF_8)));
+            }
+
+            flowFile = session.append(flowFile, out -> out.write("]".getBytes(StandardCharsets.UTF_8)));
 
             // Log end time
             long end = System.currentTimeMillis();
@@ -164,7 +182,6 @@ public class GetCouchbase extends AbstractProcessor {
             session.transfer(flowFile, FAILURE);
         }
     }
-
     
 
     @OnStopped
