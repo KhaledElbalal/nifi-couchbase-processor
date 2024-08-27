@@ -1,10 +1,13 @@
 package khaled.processors.couchbaseProcessor;
 
 import com.couchbase.client.java.Cluster;
+import com.couchbase.client.core.deps.com.fasterxml.jackson.core.JsonFactory;
+import com.couchbase.client.core.deps.com.fasterxml.jackson.core.JsonParser;
+import com.couchbase.client.core.deps.com.fasterxml.jackson.core.JsonToken;
+import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.ObjectMapper;
+import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.node.ObjectNode;
 import com.couchbase.client.java.Bucket;
 import com.couchbase.client.java.Collection;
-import com.couchbase.client.java.json.JsonArray;
-import com.couchbase.client.java.query.QueryResult;
 
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.annotation.lifecycle.OnStopped;
@@ -21,14 +24,13 @@ import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.processor.ProcessorInitializationContext;
 
 import java.io.InputStream;
-import java.io.StringWriter;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+
 
 @Tags({"couchbase", "insert", "document"})
 @CapabilityDescription("Inserts documents into a Couchbase collection from a FlowFile")
@@ -84,13 +86,6 @@ public class PutCouchbase extends AbstractProcessor {
         .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
         .build();
 
-    public static final PropertyDescriptor DOCUMENT_ID = new PropertyDescriptor.Builder()
-        .name("Document ID")
-        .description("The ID of the document to insert")
-        .required(true)
-        .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
-        .build();
-
     private Cluster cluster;
     private Bucket bucket;
     private Collection collection;
@@ -102,7 +97,7 @@ public class PutCouchbase extends AbstractProcessor {
     protected void init(ProcessorInitializationContext context) {
         super.init(context);
         this.descriptors = Arrays.asList(
-            CONNECTION_NAME, USERNAME, PASSWORD, BUCKET, SCOPE, COLLECTION, DOCUMENT_ID
+            CONNECTION_NAME, USERNAME, PASSWORD, BUCKET, SCOPE, COLLECTION
         );
 
         this.descriptors = Collections.unmodifiableList(this.descriptors);
@@ -143,49 +138,74 @@ public class PutCouchbase extends AbstractProcessor {
         }
 
         try {
-            long start = System.currentTimeMillis();
-            String documentIdPrefix = context.getProperty(DOCUMENT_ID).getValue();
+            long start = System.currentTimeMillis();            
+            Runtime runtime = Runtime.getRuntime();
 
-            // Properly close the InputStream using try-with-resources
-            final String flowFileContent;
+            long totalMemory = runtime.totalMemory();
+            long maxMemory = runtime.maxMemory();
+            long freeMemory = runtime.freeMemory();
+            long usedMemory = totalMemory - freeMemory;
+
+            getLogger().info("Total memory: " + totalMemory);
+            getLogger().info("Max memory: " + maxMemory);
+            getLogger().info("Free memory: " + freeMemory);
+            getLogger().info("Used memory: " + usedMemory);
+
+            long startInsert = System.currentTimeMillis();
+
+
             try (InputStream inputStream = session.read(flowFile)) {
-                flowFileContent = new String(inputStream.readAllBytes(), StandardCharsets.UTF_8);
-            }
-
-            // Parse the content as a JSON array
-            JsonArray jsonArray;
-            try {
-                jsonArray = JsonArray.fromJson(flowFileContent);
-            } catch (Exception e) {
-                getLogger().error("Invalid JSON array structure in FlowFile content", e);
-                session.transfer(flowFile, FAILURE);
-                return;
-            }
-
-            // Insert the JSON array into the Couchbase collection
-
-            String query = String.format("INSERT INTO `%s`.`%s`.`%s` (KEY, VALUE)", bucket.name(), collection.scopeName(), collection.name());
-
-            StringWriter arrayContent = new StringWriter();
-            arrayContent.write(query);
-            for (int i = 0; i < jsonArray.size(); i++) {
-                if (i > 0) {
-                    arrayContent.write(", ");
-                }
-                arrayContent.write(" VALUES ");
-                arrayContent.write("('" + documentIdPrefix + i + "', " + jsonArray.get(i).toString() + ")");
-            }
+                JsonFactory jsonFactory = new JsonFactory();
+                ObjectMapper objectMapper = new ObjectMapper();
             
-            QueryResult queryContent = cluster.query(arrayContent.toString());
-            getLogger().info("Inserted documents: " + queryContent.toString());
+                try (JsonParser jsonParser = jsonFactory.createParser(inputStream)) {
+                    StringBuilder stringBuilder = new StringBuilder();
+                    
+                    String query = String.format("INSERT INTO `%s`.`%s`.`%s` (KEY, VALUE)", bucket.name(), collection.scopeName(), collection.name());
+            
+                    stringBuilder.append(query);
+
+                    Boolean inserted = false;
+            
+                    while (jsonParser.nextToken() != JsonToken.END_ARRAY) {
+                        if (jsonParser.currentToken() == JsonToken.START_OBJECT) {  
+                            ObjectNode objectNode = objectMapper.readTree(jsonParser);
+                            
+                            String key = objectNode.get("COUCHBASE_META_DOCUMENT_ID").asText();
+                            objectNode.remove("COUCHBASE_META_DOCUMENT_ID");
+                            String value = " VALUES (\"" + key  + "\", " + objectNode.toString() + ")";
+
+                            if(inserted) {
+                                stringBuilder.append(",");
+                            }
+                            inserted = true;
+                            stringBuilder.append(value);
+                            if(stringBuilder.length() > 1000000) {
+                                cluster.query(stringBuilder.toString());
+                                stringBuilder = new StringBuilder();
+                                stringBuilder.append(query);
+                                inserted = false;
+                            }
+                        }
+                    }
+
+
+                    cluster.query(stringBuilder.toString());
+                }
+            }            
+
+            session.remove(flowFile);
+            flowFile = session.create(flowFile);
+
+            getLogger().info("Query executed in: " + (System.currentTimeMillis() - startInsert) + "ms");
             long end = System.currentTimeMillis();
+
             getLogger().info("Time taken to insert documents: " + (end - start) + "ms");
 
-            
             session.transfer(flowFile, SUCCESS);
 
         } catch (Exception e) {
-            getLogger().error("Error inserting documents into Couchbase", e);
+            getLogger().error("Error inserting documents into Couchbase", e.getMessage());
             session.transfer(flowFile, FAILURE);
         }
     }
