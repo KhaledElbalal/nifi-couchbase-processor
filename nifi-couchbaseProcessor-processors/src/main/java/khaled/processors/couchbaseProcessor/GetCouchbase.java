@@ -33,6 +33,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.ThreadPoolExecutor;
 
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
 
 @Tags({"couchbase", "query", "document"})
 @CapabilityDescription("Queries all documents from a Couchbase collection and writes the results to a FlowFile")
@@ -102,7 +107,6 @@ public class GetCouchbase extends AbstractProcessor {
         .addValidator(StandardValidators.LONG_VALIDATOR)
         .build();
 
-
     private Cluster cluster;
     private Bucket bucket;
     private Collection collection;
@@ -150,69 +154,80 @@ public class GetCouchbase extends AbstractProcessor {
 
     @Override
     public void onTrigger(ProcessContext context, ProcessSession session) throws ProcessException {
+        ExecutorService executorService = Executors.newFixedThreadPool(4); // 4 threads
+
         try {
             String orderBy = context.getProperty(ORDER_BY).getValue();
             Runtime runtime = Runtime.getRuntime();
-
+    
             long totalMemory = runtime.totalMemory();
             long maxMemory = runtime.maxMemory();
             long freeMemory = runtime.freeMemory();
             long usedMemory = totalMemory - freeMemory;
-
+    
             getLogger().info("Total memory: " + totalMemory);
             getLogger().info("Max memory: " + maxMemory);
             getLogger().info("Free memory: " + freeMemory);
             getLogger().info("Used memory: " + usedMemory);
-            
+    
             long averageSize = 8 * 500;
             QueryResult countOfDocuments = cluster.query("SELECT COUNT(*) FROM `" + bucket.name() + "`.`" + collection.scopeName() + "`.`" + collection.name() + "`");
             long count = countOfDocuments.rowsAsObject().get(0).getLong("$1");
-
-            
+    
             long start = System.currentTimeMillis();
-
+    
             long byteLimit = 8 * 1024 * 1024 * Long.parseLong(context.getProperty(BATCH_SIZE_MB).getValue());
             long batchSize = byteLimit / averageSize;
-
+    
             getLogger().info("Batch size: " + batchSize);
             getLogger().info("Total number of documents: " + count);
             getLogger().info("Average document size: " + averageSize);
             getLogger().info("Total number of batches: " + (count / batchSize + 1));
-
-            long offset = 0;
-            long limit = batchSize;
-            for (long i = 0; i < count; i += batchSize) {
-                getLogger().info("Querying batch: " + (i / batchSize + 1));
-                long startBatch = System.currentTimeMillis();
-
-                String query = "SELECT Meta().id as COUCHBASE_META_DOCUMENT_ID,`" + collection.name() + "`.* FROM `" + bucket.name() + "`.`" + collection.scopeName() + "`.`" + collection.name() + "` `" + collection.name() + "` ORDER BY " + orderBy + " LIMIT " + limit + " OFFSET " + offset;
-                QueryResult result = cluster.query(query);
-                offset += batchSize;
-
-                String resultContentString = result.rowsAsObject().toString();
-                resultContentString = resultContentString.substring(1, resultContentString.length() - 1);
-                final String processedResult = resultContentString;
-
-                FlowFile batchFlowFile = session.create();
-                batchFlowFile = session.append(batchFlowFile, out -> out.write("[".getBytes(StandardCharsets.UTF_8)));
-                batchFlowFile = session.append(batchFlowFile, out -> out.write(processedResult.getBytes(StandardCharsets.UTF_8)));
-                batchFlowFile = session.append(batchFlowFile, out -> out.write("]".getBytes(StandardCharsets.UTF_8)));
-                session.transfer(batchFlowFile, SUCCESS);
-                session.commit();
-
-                getLogger().info("Time taken to query batch: " + (System.currentTimeMillis() - startBatch) + "ms");
+    
+            long totalBatches = count / batchSize + 1;
+    
+            for (long i = 0; i < totalBatches; i++) {
+                long currentOffset = i * batchSize;
+                long currentLimit = batchSize;
+    
+                executorService.submit(() -> {
+                    try {
+                        getLogger().info("Querying batch: " + (currentOffset / batchSize + 1));
+                        long startBatch = System.currentTimeMillis();
+    
+                        String query = "SELECT Meta().id as COUCHBASE_META_DOCUMENT_ID,`" + collection.name() + "`.* FROM `" + bucket.name() + "`.`" + collection.scopeName() + "`.`" + collection.name() + "` `" + collection.name() + "` ORDER BY " + orderBy + " LIMIT " + currentLimit + " OFFSET " + currentOffset;
+                        QueryResult result = cluster.query(query);
+    
+                        String resultContentString = result.rowsAsObject().toString();
+                        resultContentString = resultContentString.substring(1, resultContentString.length() - 1);
+                        final String processedResult = resultContentString;
+    
+                        FlowFile batchFlowFile = session.create();
+                        batchFlowFile = session.append(batchFlowFile, out -> out.write("[".getBytes(StandardCharsets.UTF_8)));
+                        batchFlowFile = session.append(batchFlowFile, out -> out.write(processedResult.getBytes(StandardCharsets.UTF_8)));
+                        batchFlowFile = session.append(batchFlowFile, out -> out.write("]".getBytes(StandardCharsets.UTF_8)));
+                        session.transfer(batchFlowFile, SUCCESS);
+                        session.commit();
+    
+                        getLogger().info("Time taken to query batch: " + (System.currentTimeMillis() - startBatch) + "ms");
+                    } catch (Exception e) {
+                        getLogger().error("Error querying batch from Couchbase", e.getMessage());
+                    }
+                });
             }
-            
-            // Log end time
+    
+            executorService.shutdown();
+            executorService.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
+    
             long end = System.currentTimeMillis();
             getLogger().info("Time taken to query documents from Couchbase: " + (end - start) + "ms");
-
+    
         } catch (Exception e) {
             getLogger().error("Error querying documents from Couchbase", e.getMessage());
-
+    
             FlowFile flowFile = session.create();
             flowFile = session.write(flowFile, out -> out.write("[]".getBytes(StandardCharsets.UTF_8)));
-
+    
             session.transfer(flowFile, FAILURE);
         }
     }
