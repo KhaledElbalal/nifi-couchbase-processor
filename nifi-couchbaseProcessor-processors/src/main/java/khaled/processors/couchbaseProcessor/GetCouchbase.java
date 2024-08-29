@@ -154,7 +154,7 @@ public class GetCouchbase extends AbstractProcessor {
 
     @Override
     public void onTrigger(ProcessContext context, ProcessSession session) throws ProcessException {
-        ExecutorService executorService = Executors.newFixedThreadPool(4); // 4 threads
+        ExecutorService executorService = Executors.newFixedThreadPool(3); // 4 threads
 
         try {
             String orderBy = context.getProperty(ORDER_BY).getValue();
@@ -223,7 +223,7 @@ public class GetCouchbase extends AbstractProcessor {
             getLogger().info("Time taken to query documents from Couchbase: " + (end - start) + "ms");
     
         } catch (Exception e) {
-            getLogger().error("Error querying documents from Couchbase", e.getMessage());
+            getLogger().error("Error querying documents from Couchbase", e);
     
             FlowFile flowFile = session.create();
             flowFile = session.write(flowFile, out -> out.write("[]".getBytes(StandardCharsets.UTF_8)));
