@@ -177,7 +177,7 @@ public class GetCouchbase extends AbstractProcessor {
             long start = System.currentTimeMillis();
     
             long byteLimit = 8 * 1024 * 1024 * Long.parseLong(context.getProperty(BATCH_SIZE_MB).getValue());
-            long batchSize = byteLimit / averageSize;
+            long batchSize = 1000;
     
             getLogger().info("Batch size: " + batchSize);
             getLogger().info("Total number of documents: " + count);
