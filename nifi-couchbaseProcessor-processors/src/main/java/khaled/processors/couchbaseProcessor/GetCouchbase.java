@@ -162,6 +162,8 @@ public class GetCouchbase extends AbstractProcessor {
             getLogger().info("Used memory: " + usedMemory);
             
             long averageSize = 8 * 500;
+            QueryResult countOfDocuments = cluster.query("SELECT COUNT(*) FROM `" + bucket.name() + "`.`" + collection.scopeName() + "`.`" + collection.name() + "`");
+            long count = countOfDocuments.rowsAsObject().get(0).getLong("$1");
 
             
             long start = System.currentTimeMillis();
