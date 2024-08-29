@@ -180,7 +180,7 @@ public class PutCouchbase extends AbstractProcessor {
                             }
                             inserted = true;
                             stringBuilder.append(value);
-                            if(stringBuilder.length() > 1000000) {
+                            if(stringBuilder.length() > 10000000) {
                                 cluster.query(stringBuilder.toString());
                                 stringBuilder = new StringBuilder();
                                 stringBuilder.append(query);
